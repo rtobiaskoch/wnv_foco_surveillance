@@ -1,0 +1,372 @@
+---
+title: "WNV-FoCo_Sur_PosID"
+author: "Toby Koch"
+date: "2024-02-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_unload()
+
+source("config.R")
+
+#packages used in the analysis
+pacman::p_load(pkg_list, character.only = T)
+ 
+
+```
+
+
+#READ AND CONSOLIDATE FULLL REPORT
+PURPOSE:
+Consolidating pcr results from full report
+
+Notes: primarily doing this for 2017 because data was blank but going to see if it 
+would work for all years in order to combine all available surveillance data
+such as trap and mosquito data.
+
+```{r}
+#get list of file paths for all files that contain pattern
+t = list.files(pattern = "full\\sreport",
+               recursive = T,
+               full.names = T,
+               ignore.case = T)  
+
+#remove files that contain full report but are not the live data/don't open and are copies
+t = t[!grepl("~\\$FC|skeleton|test", t, ignore.case = T)]
+
+
+convert_to_date <- function(df) {
+  # Check if "Trap Date" column exists in the dataframe
+  if ("Trap Date" %in% names(df)) { # Check if "Trap Date" column is numeric
+    if (is.character(df[["Trap Date"]])) { # Convert "Trap Date" column to date format
+      df <- df %>%
+        mutate(`Trap Date` = as.Date(as.numeric(`Trap Date`), origin = "1899-12-30")) 
+    }
+  }
+  return(df)
+}
+
+#read and combine all the full report files 
+data0 = t %>% 
+  map(~read_excel(.x, col_names = T,
+                  sheet = "Weekly Data Input",
+                  col_types = "text")) %>%
+  #map(convert_to_date) %>%
+  #map(~ .x %>% mutate_if(is.numeric, as.character)) %>%
+  bind_rows() %>%
+  distinct_all() #getting warnings but data still looks good
+```
+
+
+
+#READ IN 13 & 14
+POSITIVES FROM 2013 AND 2014
+need to pull data from consolidated lists for 2013 and 2014 
+because Full Report files do not exist for these documents
+It seems this was before they had started the full report work
+but there are consolidated list files for 2013 and 2014
+```{r}
+
+
+d2013 = read.csv("data_input/2013 WNV consolidation list.csv")
+
+d2013 = d2013 %>%
+  filter(!is.na(year)) %>%
+  filter(year != "Year")%>%
+  mutate(test_code = "1") %>%
+  select(any_of(col_keep)) %>%
+  mutate_all(trimws)
+
+
+#2014
+d2014 = read_csv("data_input/2014 WNV consolidation list.csv")
+
+d2014 = d2014 %>%
+  mutate(test_code = "1") %>%
+  rename(trap_type = "method") %>%
+  select(any_of(col_keep)) %>%
+  mutate_all(trimws)
+
+write.csv(d2014, "data_mid/2014_test.csv")
+
+```
+
+
+
+READ IN SEQ SAMPLES TO IDENTIFY POSITIVE SAMPLES THAT AREN'T SEQUENCED
+```{r}
+seq_samples = read.csv("data_input/mdata_co.csv")
+```
+
+
+#COMBINE FULL REPORT WITH 13 AND 14 AND CLEAN
+PURPOSE:
+COMBINE 2013 AND 2014 POSITIVES AND CLEAN DATA
+
+NOTES:
+rename samples from original
+combine with 2013 and 2014
+remove - in CSU ID
+
+
+```{r}
+date_col = c("trap_date")
+num_col = c("year", "week", "no_gravid","no_deplete", "total", "test_code", "seq")
+
+
+data_all = clean_names(data0) %>%
+  rename(!!!batch_rename) %>%
+  select(all_of(col_keep)) %>%
+  bind_rows(d2013) %>%
+  bind_rows(d2014) %>%
+  mutate_all(trimws) %>%
+  mutate_all(~str_replace_all(.x, "[^[:print:]]", "")) %>% #remove any weird symbols
+  mutate(csu_id = str_replace(csu_id, "-", "")) %>% #remove "-" to match accession 
+  mutate(seq = if_else(csu_id %in% seq_samples$accession, 1,0)) %>% #id unseq positives
+  mutate(across(all_of(num_col),
+                as.numeric)) %>%
+    mutate(across(all_of(date_col),
+                   ~as.Date(as.numeric(.x), origin = "1899-12-30"))
+           ) %>%
+  mutate(across(all_of(num_col), replace_na, 0)) %>% #convert the missing gravid/deplete values to 0
+  distinct_all()
+  
+data_na = data_all[!complete.cases(data_all),]
+
+data_all = data_all %>% 
+  filter(!is.na(year) & year != "" & year != 0)
+
+data_all %>% group_by(year) %>% count()
+
+
+#WRITE TO FILE
+file_name = paste0("data_output/",
+                   min(data_all$year, na.rm = T),"-", 
+                   max(data_all$year, na.rm = T),
+                   "_WNV_pcr_all_pools.csv")
+
+write_csv(data_all, file_name)
+```
+
+
+Summary statistics of all mosquito pools tested
+
+NOTES:
+removes 2013 and 2014 because we only have positives and limited data from then.
+```{r}
+test_sum = data_all %>% group_by(year) %>%
+  filter(year >= 2015) %>% #remove 2014 because we don't have good data from before 2015
+  summarise(n = n(),
+            pos = sum(test_code)) %>%
+  mutate(pct = round(pos/n, 4)*100) %>%
+  drop_na()
+
+test_sum_p <- ggplot(test_sum) +
+  geom_line(aes(x = year, y = n, color = "n"), size = 1, group = 1) +
+  geom_line(aes(x = year, y = pos, color = "pos"), size = 1, group = 1) +
+  scale_color_manual(values = c("n" = "blue", "pos" = "red")) +
+  labs(title = "WNV Pool Tested Overtime",
+       y = "Count",
+       color = "Variable") +
+  theme_minimal()
+
+# Plot
+plot(test_sum_p)
+
+```
+
+
+
+Positives consolidation from full report files and consolidation files
+```{r}
+
+data_pos = data_all %>%
+  filter(test_code == 1)
+
+file_name = paste0("data_output/",
+                   min(data_all$year, na.rm = T),"-", 
+                   max(data_all$year, na.rm = T),
+                   "_WNV_pcr_positives.csv")
+
+write_csv(data_pos, file_name)
+
+```
+
+
+#GET UNSEQ POS
+SCRIPT BELOW PURPOSE: 
+Compare list of positives to sequenced samples to find unsequenced positives
+
+NOTES:
+2024-02-13: mdata_co.csv is the most available list of FoCo sequences that was provided for 
+the nextstrain build. (n = 696)
+
+```{r}
+
+unseq_positives = data_all %>%
+  filter(test_code == 1 & seq == 0)
+
+unseq_positives %>% group_by(year) %>%
+  count()
+
+# positive_2023 = unseq_positives %>%
+#   filter(year == 2023) %>%
+#   select(any_of(col_keep))
+# 
+# write.csv(positive_2023, "data_output/2023_WNV_pcr_postives.csv")
+# 
+# 
+# positive_2022 = unseq_positives %>%
+#   filter(year == 2022) %>%
+#   select(any_of(col_keep))
+# 
+# write.csv(positive_2022, "data_output/2022_WNV_pcr_postives.csv")
+
+```
+
+
+
+
+#GET CT FROM PLATEMAPS
+
+```{r}
+t = list.files(pattern = "q-RT.*PCR\\sPlate",
+               recursive = T,
+               full.names = T,
+               ignore.case = T) 
+
+
+t = t[!grepl("~\\$FC|skeleton|test", t, ignore.case = T)]
+
+#t = t[grepl("2021", t)]
+
+#t = sample(t, 3)
+
+read_excel_w_filepath <- function(file) {
+  filepath <- file
+  data <- read_excel(file,
+                    col_names = T, 
+                    col_types = "text")
+  data$filepath <- basename(file)
+  return(data)
+}
+
+
+#read and combine all the full report files 
+plate_map0 = t %>% 
+  map(read_excel_w_filepath) %>%
+  bind_rows() 
+
+
+# #read and combine all the full report files 
+# plate_map0 = t %>% 
+#   map(~read_excel(.x, col_names = T, 
+#                   col_types = "text")) %>%
+#   map(~.x$file = t)
+#   bind_rows() 
+  
+  
+
+#keep only the actual platemap columns
+plate_map = plate_map0[,c(15:31)] %>%
+  clean_names() 
+
+  #filter_at(vars(starts_with("x")), all_vars(!is.na(.))) # gets rid of row if any na for some reason
+
+plate_map2 = plate_map[53:nrow(plate_map),]
+  
+#create new column names
+new_names = c("file", "plate_row", "value","row", "type",  paste0("col", 1:12))
+
+colnames(plate_map2) = new_names
+
+
+plate_map2 = plate_map2[2:nrow(plate_map2),] #remove row that had column names
+
+#fill out row name 
+plate_map2 = plate_map2 %>%
+     fill(row, .direction = "down")
+
+
+plate_map2 = plate_map2 %>%
+   # filter(str_length(plate_map$plate_row) == 1) %>% # remove the gaps between plates
+    filter(!is.na(value))
+
+#n_plates = nrow(plate_map)/16
+
+#plate_no = sort(rep(seq(from = 1, to = n_plates),16)) #create unique plate_no id 8 plate rows with sample & cq (8*2 =16)
+
+plate_map1 = plate_map %>%
+   # mutate(plate_no = sort(rep(seq(from = 1, to = nrow(plate_map)/16),16)) 
+  #         ) %>%
+    pivot_longer(
+      cols = -c(file, plate_row, value), 
+      names_to = "row", 
+      values_to = "value2") %>%
+  ungroup() %>%
+    mutate(row = as.numeric(str_extract(row, "\\d+"))) %>%
+    select(file, plate_row, row, value, value2) %>%
+    arrange(file, plate_row, row) %>%
+    mutate(value2 = str_remove(value2, "-"))
+
+
+# List of csu_id to match
+
+id_list = na.omit(data_all$csu_id)
+
+# Identify rows where csu_id matches values in the list
+matched_id <- which(plate_map$value2 %in% id_list)
+id = plate_map[matched_id, "value2"]
+file = plate_map[matched_id, "file"]
+id = id$value2
+file = file$file
+
+matched_cq <- matched_id + 1
+
+cq = plate_map[matched_cq, "value2"]
+cq = cq$value2
+
+cq_id = data.frame(csu_id = id,
+                   cq = cq,
+                   file = file)
+cq_id = cq_id %>%
+  mutate(cq = as.numeric(cq)) %>% #all no's introduced by coercion are "N/A" characters
+  filter(!is.na(cq)) %>%
+  distinct_all()
+                   
+write.csv(cq_id, "data_output/cq_values.csv")
+
+```
+
+
+
+```{r}
+data_all_cq = data_all %>%
+  left_join(cq_id %>% select(csu_id, cq),
+            by = c("csu_id"))
+
+```
+
+
+```{r}
+pos_cq_plot = ggplot(data_all_cq %>% filter(!is.na(cq)), aes(x = year, y = cq, color = as.factor(test_code), fill = as.factor(test_code))) +
+  geom_jitter(aes(text = paste(csu_id,week))) +
+  xlim(2019,2023) +
+  theme_classic()
+
+plotly::ggplotly(pos_cq_plot,tooltip = c("text"))
+
+
+ggplot(data_all_cq %>% filter(!is.na(cq)), aes(x = week, y = cq, color = as.factor(seq), fill = as.factor(seq))) +
+  geom_jitter() +
+  xlim(2019,2023) +
+  theme_classic()
+
+```
+
