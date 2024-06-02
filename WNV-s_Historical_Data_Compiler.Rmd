@@ -233,7 +233,7 @@ unseq_positives %>% group_by(year) %>%
 
 
 
-#GET CT FROM PLATEMAPS
+#READ AND BIND PLATEMAPS
 
 ```{r}
 t = list.files(pattern = "q-RT.*PCR\\sPlate",
@@ -251,7 +251,7 @@ t = t[!grepl("~\\$FC|skeleton|test", t, ignore.case = T)]
 read_excel_w_filepath <- function(file) {
   filepath <- file
   data <- read_excel(file,
-                    col_names = T, 
+                    col_names = F, 
                     col_types = "text")
   data$filepath <- basename(file)
   return(data)
@@ -262,85 +262,87 @@ read_excel_w_filepath <- function(file) {
 plate_map0 = t %>% 
   map(read_excel_w_filepath) %>%
   bind_rows() 
+```
 
+#CLEAN PLATEMAPS
+```{r}
 
-# #read and combine all the full report files 
-# plate_map0 = t %>% 
-#   map(~read_excel(.x, col_names = T, 
-#                   col_types = "text")) %>%
-#   map(~.x$file = t)
-#   bind_rows() 
-  
-  
 
 #keep only the actual platemap columns
-plate_map = plate_map0[,c(15:31)] %>%
-  clean_names() 
+ plate_map1 = plate_map0[,c(15:29)]
 
   #filter_at(vars(starts_with("x")), all_vars(!is.na(.))) # gets rid of row if any na for some reason
 
-plate_map2 = plate_map[53:nrow(plate_map),]
+#plate_map2 = plate_map[53:nrow(plate_map),]
   
 #create new column names
-new_names = c("file", "plate_row", "value","row", "type",  paste0("col", 1:12))
+new_names = c("file","row", "type",  paste0("col", 1:12))
 
-colnames(plate_map2) = new_names
-
-
-plate_map2 = plate_map2[2:nrow(plate_map2),] #remove row that had column names
-
-#fill out row name 
-plate_map2 = plate_map2 %>%
-     fill(row, .direction = "down")
+colnames(plate_map1) = new_names
 
 
-plate_map2 = plate_map2 %>%
-   # filter(str_length(plate_map$plate_row) == 1) %>% # remove the gaps between plates
-    filter(!is.na(value))
+#plate_map2 = plate_map1[2:nrow(plate_map1),] #remove row that had column names
 
-#n_plates = nrow(plate_map)/16
+#remove blank rowss
+plate_map2 = plate_map1 %>%
+  mutate_all(str_trim) %>%
+  #filter(!is.na(type)&type != 'Content') %>%
+  filter(type == "Cq" | type == "Sample") %>%
+  select(-row)
 
-#plate_no = sort(rep(seq(from = 1, to = n_plates),16)) #create unique plate_no id 8 plate rows with sample & cq (8*2 =16)
-
-plate_map1 = plate_map %>%
-   # mutate(plate_no = sort(rep(seq(from = 1, to = nrow(plate_map)/16),16)) 
-  #         ) %>%
-    pivot_longer(
-      cols = -c(file, plate_row, value), 
-      names_to = "row", 
-      values_to = "value2") %>%
-  ungroup() %>%
-    mutate(row = as.numeric(str_extract(row, "\\d+"))) %>%
-    select(file, plate_row, row, value, value2) %>%
-    arrange(file, plate_row, row) %>%
-    mutate(value2 = str_remove(value2, "-"))
+```
 
 
-# List of csu_id to match
+#RESHAPE DATA
+```{r}
+#add id for cq and sample for pivoting
 
-id_list = na.omit(data_all$csu_id)
 
-# Identify rows where csu_id matches values in the list
-matched_id <- which(plate_map$value2 %in% id_list)
-id = plate_map[matched_id, "value2"]
-file = plate_map[matched_id, "file"]
-id = id$value2
-file = file$file
+id = rep(1:ceiling(nrow(plate_map2)/2),2)
+id = sort(id)
 
-matched_cq <- matched_id + 1
 
-cq = plate_map[matched_cq, "value2"]
-cq = cq$value2
+#separate cq and id to make longer them merge
+cq = plate_map2 %>%
+  mutate(id = id) %>%
+  filter(type == "Cq") %>%
+  pivot_longer(cols = starts_with("col"), names_to = "col_name", values_to = "Cq") %>%
+  select(-type)
 
-cq_id = data.frame(csu_id = id,
-                   cq = cq,
-                   file = file)
-cq_id = cq_id %>%
-  mutate(cq = as.numeric(cq)) %>% #all no's introduced by coercion are "N/A" characters
-  filter(!is.na(cq)) %>%
+sample = plate_map2 %>%
+  mutate(id = id) %>%
+  filter(type == "Sample") %>%
+  pivot_longer(cols = starts_with("col"), names_to = "col_name", values_to = "sample") %>%
+  select(-type)
+
+cq_id = left_join(cq, sample, by = c("file", "col_name", "id")) %>%
+  mutate(csu_id = str_remove(sample, "-")) %>%
+  mutate(cq = as.numeric(Cq)) %>%
+  filter(str_detect(sample, "CSU")) %>%
+  select(csu_id, cq, file) %>%
   distinct_all()
+
+#have dupilcates because some samples were run multiple times
+dupes = janitor::get_dupes(cq_id, csu_id)
+
+#get list of samples that were run multiple times that had NA or the higher cq value for filtering
+rm_cq_id = cq_id %>% distinct_all() %>%
+    mutate(dup = duplicated(csu_id) | duplicated(csu_id, fromLast = TRUE)) %>% #find duplicated ids
+    filter(dup == TRUE) %>% #keep only duplicated csu_ids
+    distinct(csu_id,cq, .keep_all = T) %>% #keep first instance of csu_id and cq are the same
+    group_by(csu_id) %>% 
+    mutate(high_cq = if_else(cq == max(cq, na.rm = F), T, F)) %>% #find the >>ct for samples that were dupes 
+    filter(high_cq == T|is.na(high_cq)) %>% #remove the lower cq values because we want to keep those
+    ungroup()
+
+#remove the samples with duplicates taht 
+cq_id2 = cq_id %>% 
+  anti_join(rm_cq_id, by = c("csu_id", "cq")) %>%
+  mutate(cq = if_else(is.na(cq), 55.55, cq)) #make samples with no detectable cq 99 foer identifying unmatched samples in merge
+
+dupes2 = cq_id2 %>% janitor::get_dupes(csu_id)
                    
-write.csv(cq_id, "data_output/cq_values.csv")
+write.csv(cq_id2, "data_output/cq_values.csv")
 
 ```
 
@@ -348,24 +350,59 @@ write.csv(cq_id, "data_output/cq_values.csv")
 
 ```{r}
 data_all_cq = data_all %>%
-  left_join(cq_id %>% select(csu_id, cq),
+  left_join(cq_id2 %>% select(csu_id, cq),
             by = c("csu_id"))
+
+write.csv(data_all_cq, "data_output/2013-2023_WNV_cq_all_data.csv")
+
+unmatched_cq = 
+  data_all_cq %>%
+  filter(is.na(cq)) 
+
+unmatched_cq_stats = 
+  data_all_cq %>%
+  filter(is.na(cq)) %>%
+  group_by(year,week) %>%
+  count()
 
 ```
 
 
 ```{r}
-pos_cq_plot = ggplot(data_all_cq %>% filter(!is.na(cq)), aes(x = year, y = cq, color = as.factor(test_code), fill = as.factor(test_code))) +
-  geom_jitter(aes(text = paste(csu_id,week))) +
+# na_cq = data_all_cq %>%
+#   filter(cq == 55.55) %>%
+#   nrow()
+# jit = runif(na_cq, 1,15)
+
+pacman::p_load(wesanderson)
+selected_palette <- wes_palette("Darjeeling1")
+
+pos_cq_plot = data_all_cq %>% 
+  filter(!is.na(cq)&cq<55) %>%
+  #mutate(cq = if_else(cq == 55.55, cq + jit ,cq)) %>% # add vertical jitter to negatives
+  ggplot(aes(x = year, y = cq, color = as.factor(test_code), fill = as.factor(test_code))) +
+  geom_jitter(aes(text = paste(csu_id,week,cq)), alpha = 0.7,size = 1.5) +
+  scale_color_manual(values = selected_palette) +
+  scale_fill_manual(values = selected_palette) +
   xlim(2019,2023) +
+  labs(color = "Positive",
+       fill = "Positive") +
   theme_classic()
+
+pos_cq_plot
+
+ggsave("data_output/pos_cq_plot.png",pos_cq_plot, width = 6, height = 3)
 
 plotly::ggplotly(pos_cq_plot,tooltip = c("text"))
 
-
-ggplot(data_all_cq %>% filter(!is.na(cq)), aes(x = week, y = cq, color = as.factor(seq), fill = as.factor(seq))) +
+pos_seq_cq_plot = data_all_cq %>% 
+  filter(test_code == 1) %>%
+ggplot(aes(x = year, y = cq, color = as.factor(seq), fill = as.factor(seq))) +
   geom_jitter() +
-  xlim(2019,2023) +
+  ggtitle("Positive Samples Sequenced by Cq") +
+    scale_color_manual(values = selected_palette) +
+  scale_fill_manual(values = selected_palette) +
+ # xlim(2019,2023) +
   theme_classic()
 
 ```
